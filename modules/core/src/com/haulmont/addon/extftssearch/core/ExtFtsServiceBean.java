@@ -5,6 +5,7 @@ import com.haulmont.fts.core.sys.EntityInfo;
 import com.haulmont.fts.core.sys.LuceneSearcher;
 import com.haulmont.fts.core.sys.morphology.MorphologyNormalizer;
 import com.haulmont.fts.global.SearchResult;
+import com.haulmont.fts.global.SearchResultEntry;
 
 import java.util.*;
 import java.util.regex.Matcher;
@@ -34,7 +35,7 @@ public class ExtFtsServiceBean extends FtsServiceBean {
         SearchResult searchResult = new SearchResult(searchTerm);
         for (EntityInfo entityInfo : allFieldResults) {
             EntitiesGraph entitiesGraph = entitiesGraphsMap.get(entityInfo.getId());
-            searchResult.addHit(entityInfo.getId(), entityInfo.getText(), null, new MorphologyNormalizer());
+            searchResult.addHit(entityInfo.getId(), entityInfo.getEntityName(), entityInfo.getText(), new MorphologyNormalizer());
             if (entitiesGraph == null) {
                 entitiesGraph = new EntitiesGraph(entityInfo);
                 entitiesGraphsMap.put((UUID) entityInfo.getId(), entitiesGraph);
@@ -58,8 +59,8 @@ public class ExtFtsServiceBean extends FtsServiceBean {
             entitiesWithLinkInfos.addAll(searcher.searchLinksField(linkedEntitiesInfo.getId(), entityNames));
             for (EntityInfo entityWithLinkInfo : entitiesWithLinkInfos) {
                 EntitiesGraph entitiesGraph = entitiesGraphsMap.get((UUID) entityWithLinkInfo.getId());
-                searchResult.addHit(entityWithLinkInfo.getId(), linkedEntitiesInfo.getText(), linkedEntitiesInfo.getName(),
-                        new MorphologyNormalizer());
+                searchResult.addHit(entityWithLinkInfo.getId(), linkedEntitiesInfo.getEntityName(),
+                        linkedEntitiesInfo.getText(), new MorphologyNormalizer());
                 //EntityGraph may be not created by this moment. It may happen if main entity contains none of the
                 //search terms (all of them may be in related entities).
                 if (entitiesGraph == null) {
@@ -83,8 +84,9 @@ public class ExtFtsServiceBean extends FtsServiceBean {
             Set<String> termsFoundedInGraph = findSearchTermsInEntitiesGraph(terms, entitiesGraph);
             if (termsFoundedInGraph.containsAll(terms)) {
                 EntityInfo mainEntityInfo = entitiesGraph.getMainEntityInfo();
-                SearchResult.Entry searchResultEntry = new SearchResult.Entry(mainEntityInfo.getId(), mainEntityInfo.getId().toString());
-                searchResult.addEntry(mainEntityInfo.getName(), searchResultEntry);
+                SearchResultEntry searchResultEntry = new SearchResultEntry(mainEntityInfo.getId(),
+                        mainEntityInfo.getEntityName(), mainEntityInfo.getId().toString());
+                searchResult.addEntry(searchResultEntry);
 
                 //no hints, saying what fields contain search terms, are displayed at the moment. It requires some
                 //additional investigation
@@ -102,7 +104,7 @@ public class ExtFtsServiceBean extends FtsServiceBean {
     }
 
     /**
-     * The {@link EntityInfo#text} field contains the indexed text. The text there is stored in the following format:
+     * The {@code EntityInfo.text} field contains the indexed text. The text there is stored in the following format:
      * <pre>
      * ^^fieldName fieldValue ^^fieldName fieldValue ^^fieldName fieldValue
      * </pre>
