@@ -1,16 +1,27 @@
 package com.haulmont.addon.extftssearch.core;
 
+import com.google.common.base.Strings;
 import com.haulmont.fts.core.app.FtsServiceBean;
-import com.haulmont.fts.core.sys.EntityInfo;
+import com.haulmont.fts.core.sys.IndexSearcherProvider;
 import com.haulmont.fts.core.sys.LuceneSearcher;
-import com.haulmont.fts.core.sys.morphology.MorphologyNormalizer;
+import com.haulmont.fts.global.EntityInfo;
 import com.haulmont.fts.global.SearchResult;
 import com.haulmont.fts.global.SearchResultEntry;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.search.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+import javax.inject.Inject;
+import java.io.IOException;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+
+import static com.haulmont.fts.core.sys.LuceneConstants.*;
 
 /**
  * Extended service that allows to execute FTS searches with AND operation. Search terms may be spread out between the
@@ -18,6 +29,11 @@ import java.util.stream.Collectors;
  * entities may contain the second term
  */
 public class ExtFtsServiceBean extends FtsServiceBean {
+
+    private static final Logger log = LoggerFactory.getLogger(ExtFtsServiceBean.class);
+
+    @Inject
+    private IndexSearcherProvider indexSearcherProvider;
 
     //A regex that is used for extracting field values from the EntityInfo.text fields.
     //Text there is stored in strings like this: ^^fieldName fieldValue ^^fieldName fieldValue ^^fieldName fieldValue
@@ -35,7 +51,6 @@ public class ExtFtsServiceBean extends FtsServiceBean {
         SearchResult searchResult = new SearchResult(searchTerm);
         for (EntityInfo entityInfo : allFieldResults) {
             EntitiesGraph entitiesGraph = entitiesGraphsMap.get(entityInfo.getId());
-            searchResult.addHit(entityInfo.getId(), entityInfo.getEntityName(), entityInfo.getText(), new MorphologyNormalizer());
             if (entitiesGraph == null) {
                 entitiesGraph = new EntitiesGraph(entityInfo);
                 entitiesGraphsMap.put((UUID) entityInfo.getId(), entitiesGraph);
@@ -43,7 +58,7 @@ public class ExtFtsServiceBean extends FtsServiceBean {
         }
 
         //try to find entities that has a link to other entities (not from entityNames collection)
-        //that matches a search criteria. The search is performed with the OR
+        //that match a search criteria. The search is performed with the OR
         //condition, so the result will contain entities that have from 1 to N of passed search terms.
         Set<String> linkedEntitiesNames = new HashSet<>();
         for (String entityName : entityNames) {
@@ -59,8 +74,6 @@ public class ExtFtsServiceBean extends FtsServiceBean {
             entitiesWithLinkInfos.addAll(searcher.searchLinksField(linkedEntitiesInfo.getId(), entityNames));
             for (EntityInfo entityWithLinkInfo : entitiesWithLinkInfos) {
                 EntitiesGraph entitiesGraph = entitiesGraphsMap.get((UUID) entityWithLinkInfo.getId());
-                searchResult.addHit(entityWithLinkInfo.getId(), linkedEntitiesInfo.getEntityName(),
-                        linkedEntitiesInfo.getText(), new MorphologyNormalizer());
                 //EntityGraph may be not created by this moment. It may happen if main entity contains none of the
                 //search terms (all of them may be in related entities).
                 if (entitiesGraph == null) {
@@ -79,45 +92,61 @@ public class ExtFtsServiceBean extends FtsServiceBean {
                 .map(term -> term.replace("*", ".*") + ".*")
                 .collect(Collectors.toList());
 
-        for (Map.Entry<UUID, EntitiesGraph> entry : entitiesGraphsMap.entrySet()) {
-            EntitiesGraph entitiesGraph = entry.getValue();
-            Set<String> termsFoundedInGraph = findSearchTermsInEntitiesGraph(terms, entitiesGraph);
-            if (termsFoundedInGraph.containsAll(terms)) {
-                EntityInfo mainEntityInfo = entitiesGraph.getMainEntityInfo();
-                SearchResultEntry searchResultEntry = new SearchResultEntry(mainEntityInfo.getId(),
-                        mainEntityInfo.getEntityName(), mainEntityInfo.getId().toString());
-                searchResult.addEntry(searchResultEntry);
+        IndexSearcher indexSearcher = null;
+        try {
+            indexSearcher = indexSearcherProvider.acquireIndexSearcher();
+            for (Map.Entry<UUID, EntitiesGraph> entry : entitiesGraphsMap.entrySet()) {
+                EntitiesGraph entitiesGraph = entry.getValue();
+                Set<String> termsFoundedInGraph = findSearchTermsInEntitiesGraph(terms, entitiesGraph, indexSearcher);
+                if (termsFoundedInGraph.containsAll(terms)) {
+                    EntityInfo mainEntityInfo = entitiesGraph.getMainEntityInfo();
+                    SearchResultEntry searchResultEntry = new SearchResultEntry(mainEntityInfo);
+                    searchResultEntry.setDirectResult(false);
+                    searchResult.addEntry(searchResultEntry);
 
-                //no hints, saying what fields contain search terms, are displayed at the moment. It requires some
-                //additional investigation
+                    //no hints, saying what fields contain search terms, are displayed at the moment. It requires some
+                    //additional investigation
+                }
             }
+        } catch (IOException e) {
+            throw new RuntimeException("Error on finding FTS search terms in entities graph", e);
+        } finally {
+            if (indexSearcher != null)
+                indexSearcherProvider.releaseIndexSearcher(indexSearcher);
         }
 
         return searchResult;
     }
 
-    private Set<String> findSearchTermsInEntitiesGraph(Collection<String> terms, EntitiesGraph entitiesGraph) {
-        return entitiesGraph.getAllEntityInfos().stream()
-                .map(entityInfo -> findSearchTermsInEntityInfo(terms, entityInfo))
-                .flatMap(Collection::stream)
-                .collect(Collectors.toSet());
+    private Set<String> findSearchTermsInEntitiesGraph(Collection<String> terms, EntitiesGraph entitiesGraph,
+                                                       IndexSearcher indexSearcher) throws IOException {
+        Set<String> foundedSearchTerms = new HashSet<>();
+        for (EntityInfo entityInfo : entitiesGraph.getAllEntityInfos()) {
+            Collection<String> searchTermsForEntity = findSearchTermsByEntityInfo(terms, entityInfo, indexSearcher);
+            foundedSearchTerms.addAll(searchTermsForEntity);
+        }
+        return foundedSearchTerms;
     }
 
     /**
-     * The {@code EntityInfo.text} field contains the indexed text. The text there is stored in the following format:
+     * Lucene index contains the indexed text. The text there is stored in the following format:
      * <pre>
      * ^^fieldName fieldValue ^^fieldName fieldValue ^^fieldName fieldValue
      * </pre>
-     * The method parses the text and returns only those of the passed {@code terms} that have a fieldValue that matches
-     * them.
+     * The method queries lucene index for the text, parses the text and returns only those of the passed {@code terms}
+     * that have a fieldValue that matches them.
      *
-     * @param terms      a collection of search terms
-     * @param entityInfo an EntityInfo object with a filled 'text' field
-     * @return a collection of search terms that have a corresponding fieldValue in entityInfo.text
+     * @param terms         a collection of search terms
+     * @param entityInfo    an EntityInfo object that contains an information about the indexed entity
+     * @param indexSearcher lucene index searcher
+     * @return a collection of search terms that have a corresponding fieldValue in indexed text
      */
-    private Collection<String> findSearchTermsInEntityInfo(Collection<String> terms, EntityInfo entityInfo) {
+    private Collection<String> findSearchTermsByEntityInfo(Collection<String> terms, EntityInfo entityInfo,
+                                                           IndexSearcher indexSearcher) throws IOException {
         Set<String> foundedTerms = new HashSet<>();
-        Matcher matcher = FIELD_VALUE_PATTERN.matcher(entityInfo.getText());
+        String fldAll = loadIndexedText(entityInfo, indexSearcher);
+        if (Strings.isNullOrEmpty(fldAll)) return Collections.emptySet();
+        Matcher matcher = FIELD_VALUE_PATTERN.matcher(fldAll);
         while (matcher.find()) {
             String indexedPropertyValue = matcher.group(2);
             for (String term : terms) {
@@ -127,6 +156,40 @@ public class ExtFtsServiceBean extends FtsServiceBean {
             }
         }
         return foundedTerms;
+    }
+
+    /**
+     * Method creates a lucene query that finds documents by entity name and id
+     */
+    protected Query createQueryForEntityInfoSearch(EntityInfo entityInfo) {
+        BooleanQuery.Builder builder = new BooleanQuery.Builder();
+        TermQuery idQuery = new TermQuery(new Term(FLD_ID, entityInfo.getId().toString()));
+        TermQuery entityNameQuery = new TermQuery(new Term(FLD_ENTITY, entityInfo.getEntityName()));
+        builder.add(idQuery, BooleanClause.Occur.MUST);
+        builder.add(entityNameQuery, BooleanClause.Occur.MUST);
+        return builder.build();
+    }
+
+    /**
+     * Methods queries lucene index for the text that have been indexed for the given entity. The text is stored in the
+     * FLD_ALL field of the lucene document.
+     *
+     * @param entityInfo    an information about the entity
+     * @param indexSearcher lucene index searcher
+     * @return a text that have been indexed
+     */
+    @Nullable
+    protected String loadIndexedText(EntityInfo entityInfo, IndexSearcher indexSearcher) throws IOException {
+        String fldAllText = null;
+        Query query = createQueryForEntityInfoSearch(entityInfo);
+        TopDocs topDocs = indexSearcher.search(query, 1);
+        if (topDocs.scoreDocs.length == 0) {
+            log.warn("No result found for {}", entityInfo);
+            return null;
+        }
+        Document doc = indexSearcher.doc(topDocs.scoreDocs[0].doc);
+        fldAllText = doc.getField(FLD_ALL).stringValue();
+        return fldAllText;
     }
 
     /**
